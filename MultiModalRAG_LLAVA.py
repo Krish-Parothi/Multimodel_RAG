@@ -16,13 +16,14 @@ from langchain_classic.schema.messages import HumanMessage
 from langchain.chat_models import init_chat_model
 from langchain_core.documents import Document
 from langchain_groq import ChatGroq
-from langchain_community.llms import Ollama
+from ollama import Client
+ollama = Client(host="http://localhost:11434")
 
 ### Loading Clip Model so we reuired processor and model
 load_dotenv()
 
 ## set up the environment
-os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY")
+# os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY")
 
 ## Initialize Clip Model
 
@@ -34,9 +35,6 @@ clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 # CLIP processor isliye use hota hai kyunki CLIP model ko image aur text ek specific standardized format me chahiye hota hai — processor unhe convert karke ready-to-use banata hai.
 
 clip_model.eval()
-
-
-
 
 
 def embed_image(image_data):
@@ -73,7 +71,7 @@ def embed_text(text):
 
 
 ## Process PDF
-pdf_path = "multimodal_sample.pdf"
+pdf_path = "Data.pdf"
 doc = fitz.open(pdf_path)
 
 # we now create variables for Storage for all documents and embeddings
@@ -84,9 +82,6 @@ image_data_store = {}
 # Text Splitter
 splitter = RecursiveCharacterTextSplitter(chunk_size=500) 
 # RecursiveCharacterTextSplitter large text ko intelligent, meaning-preserving chunks me todta hai taaki embeddings and RAG best perform karein.
-
-
-
 
 doc
 
@@ -148,7 +143,6 @@ for i,page in enumerate(doc): #go inside my doc
 doc.close()
 
 
-
 all_docs
 
 # Create unified FAISS vector store with CLIP embeddings
@@ -167,18 +161,19 @@ vector_store = FAISS.from_embeddings(
 vector_store
 
 # Initialize llava Vision model
-llm = Ollama(
-     model="llava-v1.6-34b-hf",
-     temperature=0.8
- )
 
-#ChatGroq(
+# llm = ChatGroq(
 #     api_key=os.getenv("GROQ_API_KEY"),
-#     model="llava-v1.6-34b-hf"
+#     model="meta-llama/llama-prompt-guard-2-86m",
+#     streaming=True,
+#     temperature=0.8
 # )
+# llm = Ollama(
+#      model="llava:7b",
+#      temperature=0.8
+#  )
 
-
-llm
+# llm
 
 def retrieve_multimodal(query, k=5):
     """Unified retrieval using CLIP embeddings for both text and images."""
@@ -195,20 +190,16 @@ def retrieve_multimodal(query, k=5):
 
 
 def create_multimodal_message(query, retrieved_docs):
-    """Create a message with both text and images for GPT-4V."""
     content = []
-    
-    # Add the query
+
     content.append({
         "type": "text",
         "text": f"Question: {query}\n\nContext:\n"
     })
-    
-    # Separate text and image documents
+
     text_docs = [doc for doc in retrieved_docs if doc.metadata.get("type") == "text"]
     image_docs = [doc for doc in retrieved_docs if doc.metadata.get("type") == "image"]
-    
-    # Add text context
+
     if text_docs:
         text_context = "\n\n".join([
             f"[Page {doc.metadata['page']}]: {doc.page_content}"
@@ -218,29 +209,20 @@ def create_multimodal_message(query, retrieved_docs):
             "type": "text",
             "text": f"Text excerpts:\n{text_context}\n"
         })
-    
-    # Add images
+
     for doc in image_docs:
-        image_id = doc.metadata.get("image_id")
-        if image_id and image_id in image_data_store:
-            content.append({
-                "type": "text",
-                "text": f"\n[Image from page {doc.metadata['page']}]:\n"
-            })
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/png;base64,{image_data_store[image_id]}"
-                }
-            })
-    
-    # Add instruction
+        img_id = doc.metadata["image_id"]
+        content.append({
+            "type": "text",
+            "text": f"\n[Image from page {doc.metadata['page']}]: {img_id}\n"
+        })
+
     content.append({
         "type": "text",
-        "text": "\n\nPlease answer the question based on the provided text and images."
+        "text": "Please answer the question based on the provided text and attached images."
     })
-    
-    return HumanMessage(content=content)
+
+    return content
 
 def multimodal_pdf_rag_pipeline(query):
     """Main pipeline for multimodal RAG."""
@@ -248,10 +230,25 @@ def multimodal_pdf_rag_pipeline(query):
     context_docs = retrieve_multimodal(query, k=5)
     
     # Create multimodal message
-    message = create_multimodal_message(query, context_docs)
+    message = create_multimodal_message(query, context_docs)   # <-- message is LIST now
     
-    # Get response from GPT-4V
-    response = llm.invoke([message])
+    # Collect images for LLaVA
+    images_for_llava = []
+
+    for docu in context_docs:
+        if docu.metadata.get("type") == "image":
+            img_id = docu.metadata["image_id"]
+            b64 = image_data_store[img_id]
+            img_bytes = base64.b64decode(b64)
+            images_for_llava.append(img_bytes)
+
+    # Build text prompt
+    final_prompt = ""
+
+    # FIX: message is a LIST, not message.content
+    for part in message:
+        if part["type"] == "text":
+            final_prompt += part["text"] + "\n"
     
     # Print retrieved context info
     print(f"\nRetrieved {len(context_docs)} documents:")
@@ -265,13 +262,30 @@ def multimodal_pdf_rag_pipeline(query):
             print(f"  - Image from page {page}")
     print("\n")
     
-    return response
+    # REAL LLaVA CALL
+    stream = ollama.generate(
+    model="llava:7b",
+    prompt=final_prompt,
+    images=images_for_llava,
+    stream=True
+    )
+
+    full = ""
+    for chunk in stream:
+        if "response" in chunk:
+            print(chunk["response"], end="", flush=True)
+            full += chunk["response"]
+
+    return full
+
 
 if __name__ == "__main__":
     # Example queries
     queries = [
         
-        "Provide me detailed comprehension on the given graph and its components. "
+        "At Page 1 What Does the Graph Tells You About , and which ML Model does that graph is for? Explain that Graph and all its components in a systematic format. And there are three more graphs what does that tells?",
+        
+        "In Page 2, How many Graphs are there? , Tell Their respective functionlities and explain all labels on the graphs."
         
     ]
     
@@ -279,12 +293,5 @@ if __name__ == "__main__":
         print(f"\nQuery: {query}")
         print("-" * 50)
         answer = multimodal_pdf_rag_pipeline(query)
-        print(f"Answer: {answer}")
+        print("Answer:", answer)
         print("=" * 70)
-
-
-
-
-
-
-
